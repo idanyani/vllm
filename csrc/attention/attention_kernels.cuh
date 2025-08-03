@@ -130,13 +130,16 @@ __device__ void paged_attention_kernel(
       MIN(start_token_idx + num_blocks * BLOCK_SIZE, seq_len);
   const int num_tokens = end_token_idx - start_token_idx;
 
-  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
-  constexpr int NUM_THREAD_GROUPS =
-      NUM_THREADS / THREAD_GROUP_SIZE;  // Note: This assumes THREAD_GROUP_SIZE
-                                        // divides NUM_THREADS
-  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
-  constexpr int NUM_TOKENS_PER_THREAD_GROUP =
-      DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
+  // dnaori: Remove THREAD_GROUP_SIZE and related thread group constants.
+  // Replace with straightforward warp-based indexing.
+
+  //constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
+  //constexpr int NUM_THREAD_GROUPS =
+  //    NUM_THREADS / THREAD_GROUP_SIZE;  // Note: This assumes THREAD_GROUP_SIZE
+  //                                      // divides NUM_THREADS
+  // assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
+  // constexpr int NUM_TOKENS_PER_THREAD_GROUP =
+  //     DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
@@ -154,16 +157,28 @@ __device__ void paged_attention_kernel(
   // group fetch or compute 16 bytes at a time. For example, if the size of a
   // thread group is 4 and the data type is half, then the vector size is 16 /
   // (4 * sizeof(half)) == 2.
-  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
+
+  // dnaori: Removing old vectors.
+  //constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
+
+
+  // Set load vector size so that each thread loads 16 bytes per load
+  constexpr int TARGET_LOAD_BYTES = 16;
+  // Calculate how many scalar_t elements fit into 16 bytes
+  constexpr int VEC_SIZE = TARGET_LOAD_BYTES / sizeof(scalar_t);
+
   using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
   using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
   using Quant_vec = typename Vec<cache_t, VEC_SIZE>::Type;
 
-  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
-  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
+  //constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
+  //constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
 
-  const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
-  const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
+  // dnaori: Ceiling division. Although the code assumes it is divisible.
+  constexpr int NUM_VECS_PER_THREAD = DIVIDE_ROUND_UP(HEAD_SIZE, VEC_SIZE * WARP_SIZE);
+
+  //const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
+  //const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
 
   // Load the query to registers.
   // Each thread in a thread group has a different part of the query.
@@ -172,15 +187,46 @@ __device__ void paged_attention_kernel(
   // has 1, 5, 9, ... th vectors of the query, and so on. NOTE(woosuk): Because
   // q is split from a qkv tensor, it may not be contiguous.
   const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-  __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
-#pragma unroll
-  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
-       i += NUM_THREAD_GROUPS) {
-    const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
-    q_vecs[thread_group_offset][i] =
-        *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
+  const Q_vec* q_vec_ptr = reinterpret_cast<const Q_vec*>(q_ptr);
+
+  // dnaori: remove __shared__ to test.
+  // __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
+
+  // Each thread loads NUM_VECS_PER_THREAD vector elements spaced by warp size:
+  // dnaori: the benefit from this being shared might be related to across warp sharing.
+  //Q_vec q_vecs[NUM_VECS_PER_THREAD];
+  static_assert(HEAD_SIZE % VEC_SIZE == 0, "HEAD_SIZE must be divisible by VEC_SIZE");
+
+  constexpr int NUM_VECS_TOTAL = HEAD_SIZE / VEC_SIZE;
+
+  __shared__ Q_vec shared_q_vecs[NUM_VECS_TOTAL];
+
+  //#pragma unroll
+  //for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
+  //  const int vec_idx = lane + i * WARP_SIZE;
+  //  q_vecs[i] = q_vec_ptr[vec_idx];
+  //}
+
+  #pragma unroll
+  for (int i = thread_idx; i < NUM_VECS_TOTAL; i += NUM_THREADS) {
+    shared_q_vecs[i] = q_vec_ptr[i];
   }
-  __syncthreads();  // TODO(naed90): possible speedup if this is replaced with a
+  __syncthreads();
+
+  Q_vec q_vecs[NUM_VECS_PER_THREAD];
+  #pragma unroll
+  for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
+    const int vec_idx = lane + i * WARP_SIZE;
+    q_vecs[i] = q_vec_ptr[vec_idx];
+  }
+
+  //for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
+  //     i += NUM_THREAD_GROUPS) {
+  //  const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
+  //  q_vecs[thread_group_offset][i] =
+  //      *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
+  //}
+  //__syncthreads();  // TODO(naed90): possible speedup if this is replaced with a
                     // memory wall right before we use q_vecs
 
   // Memory planning.
@@ -192,13 +238,21 @@ __device__ void paged_attention_kernel(
 
   // x == THREAD_GROUP_SIZE * VEC_SIZE
   // Each thread group fetches x elements from the key at a time.
-  constexpr int x = 16 / sizeof(cache_t);
+  //constexpr int x = 16 / sizeof(cache_t);
+
+  //dnaori: making this more readible.
+  // consider changing "x" later.
+  constexpr int x = TARGET_LOAD_BYTES / sizeof(cache_t);
+
   float qk_max = -FLT_MAX;
 
   // Iterate over the key blocks.
   // Each warp fetches a block of keys for each iteration.
   // Each thread group in a warp fetches a key from the block, and computes
   // dot product with the query.
+
+  // dnaori: Different explanation...
+
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
 
   // blocksparse specific vars
@@ -219,6 +273,7 @@ __device__ void paged_attention_kernel(
                         1;
   }
 
+  // Loop over key blocks assigned to this warp. 
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to
@@ -233,19 +288,26 @@ __device__ void paged_attention_kernel(
       const bool is_local =
           (k_bs_block_id > q_bs_block_id - blocksparse_local_blocks);
       if (!is_remote && !is_local) {
-        for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-          const int physical_block_offset =
-              (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
-          const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
 
-          if (thread_group_offset == 0) {
-            // NOTE(linxihui): assign very large number to skipped tokens to
-            // avoid contribution to the sumexp softmax normalizer. This will
-            // not be used at computing sum(softmax*v) as the blocks will be
-            // skipped.
-            logits[token_idx - start_token_idx] = -FLT_MAX;
+        for (int token_offset = lane; token_offset < BLOCK_SIZE; token_offset += WARP_SIZE) {
+          const int token_idx = block_idx * BLOCK_SIZE + token_offset;
+          if (token_idx < seq_len) {
+              logits[token_idx - start_token_idx] = -FLT_MAX;
           }
         }
+        //for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
+        //  const int physical_block_offset =
+        //      (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
+        //  const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+
+        //  if (thread_group_offset == 0) {
+        //    // NOTE(linxihui): assign very large number to skipped tokens to
+        //    // avoid contribution to the sumexp softmax normalizer. This will
+        //    // not be used at computing sum(softmax*v) as the blocks will be
+        //    // skipped.
+        //    logits[token_idx - start_token_idx] = -FLT_MAX;
+        //  }
+        //}
         continue;
       }
     }
@@ -257,18 +319,37 @@ __device__ void paged_attention_kernel(
     // For example, if the thread group size is 4, then the first thread in
     // the group has 0, 4, 8, ... th vectors of the key, and the second thread
     // has 1, 5, 9, ... th vectors of the key, and so on.
-    for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-      const int physical_block_offset =
-          (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
-      const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD];
+
+    // dnaori: Different explanation for warps.
+    // Each thread in warp loads parts of the key vector corresponding to different
+    // slices of the head. The old thread group indexing is replaced with warp-level
+    // indexing (lane, warp_idx).
+    // 
+    //for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
+    //  const int physical_block_offset =
+    //      (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
+    //  const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+    //  K_vec k_vecs[NUM_VECS_PER_THREAD];
+
+    for (int token_offset = lane; token_offset < BLOCK_SIZE; token_offset += WARP_SIZE) {
+
+        const int token_idx = block_idx * BLOCK_SIZE + token_offset;
+
+        // Declare per-thread array of key vectors to hold parts of key for this token.
+        K_vec k_vecs[NUM_VECS_PER_THREAD];
+
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
         const cache_t* k_ptr =
             k_cache + physical_block_number * kv_block_stride +
-            kv_head_idx * kv_head_stride + physical_block_offset * x;
-        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+            kv_head_idx * kv_head_stride + token_offset * x;
+
+        // const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+        // dnaori: old thread group offset replaced with lane (thread within warp)
+        // vec_idx distributes loading of vectors across warp lanes and vector chunks
+        const int vec_idx = lane + j * WARP_SIZE;
+
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
 
@@ -286,12 +367,16 @@ __device__ void paged_attention_kernel(
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
-      float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(
-                             q_vecs[thread_group_offset], k_vecs);
+      //float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(
+      //                       q_vecs[thread_group_offset], k_vecs);
+      // dnaori: WARP instead of THREAD_GROUP_SIZE
+      float qk = scale * Qk_dot<scalar_t, WARP_SIZE>::dot(q_vecs, k_vecs);
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - seq_len + 1) : 0;
 
-      if (thread_group_offset == 0) {
+      // dnaori: Remove thread group.
+      //if (thread_group_offset == 0) {
+      if (lane == 0) {
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
         const bool mask = token_idx >= seq_len;
@@ -306,7 +391,9 @@ __device__ void paged_attention_kernel(
   // max qk value for each "warp" (not across the thread block yet).
   // The 0-th thread of each thread group already has its max qk value.
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
+  // dnaori : Remove thread group constraint.
+  //for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
     qk_max = fmaxf(qk_max, VLLM_SHFL_XOR_SYNC(qk_max, mask));
   }
   if (lane == 0) {
@@ -352,7 +439,8 @@ __device__ void paged_attention_kernel(
   }
 
   // Each thread will fetch 16 bytes from the value cache at a time.
-  constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
+  //constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
+  constexpr int V_VEC_SIZE = MIN(TARGET_LOAD_BYTES / sizeof(scalar_t), BLOCK_SIZE);
   using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
   using L_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
   using V_quant_vec = typename Vec<cache_t, V_VEC_SIZE>::Type;
